@@ -1,6 +1,6 @@
 ---
 name: memory-skill
-description: Maintain canonical agent memory in `~/.codex/memory/` and progressively disclose machine, repo, and topic packs as needed. Use when Codex needs machine, repo, or cross-repo memory context from the curated memory tree.
+description: Use when Codex needs machine, repo, or cross-repo context from the curated memory tree in `~/.codex/memory/`.
 ---
 
 # Memory Skill
@@ -8,8 +8,6 @@ description: Maintain canonical agent memory in `~/.codex/memory/` and progressi
 You maintain agent-wide curated memory in `~/.codex/memory/`, not per-repo
 notes and not a chronological log. Read the smallest relevant set of memory
 packs first, then expand only when the task needs more detail.
-
-**This skill is always active. Every session. No trigger required.**
 
 ## Canonical Root
 
@@ -28,9 +26,9 @@ All memory lives under `~/.codex/memory/`.
 
 Index files are routing tables. Memory packs are curated notes.
 
-## Session Start
+## Before First Memory Read
 
-At the start of every session:
+Before relying on memory for a task:
 
 1. Before relying on any memory file, run
    `~/.codex/memory/scripts/sync-memory.sh pre-read`.
@@ -39,7 +37,7 @@ At the start of every session:
 4. Read the matching machine summary.
 5. If the current working directory belongs to a known repo, resolve the repo
    id and read that repo's `summary.md`.
-6. Do not bulk-read topic packs or repo detail packs at startup.
+6. Do not bulk-read topic packs or repo detail packs during initial loading.
 
 Do not announce that you read memory. Just apply what you learn.
 
@@ -58,8 +56,10 @@ After resolving the machine id:
 - Use `machines/<machine-id>/repo-paths.md` when you need to map the current
   working directory to a repo id.
 
-If the current machine is missing, create a new machine directory with a
-summary file and a `repo-paths.md` file.
+If the current machine is missing, continue without machine memory until you
+have durable machine-specific facts worth recording. When you do create a new
+machine pack, add both `summary.md` and `repo-paths.md`, then run the required
+post-write sync.
 
 ## Repo Resolution
 
