@@ -1,8 +1,6 @@
+---
 name: memory-skill
-description: Always active. Maintain canonical agent memory in `~/.codex/memory/` and progressively disclose machine, repo, and topic packs as needed.
-author: Codex
-version: 8.0.0
-date: 2026-03-24
+description: Maintain canonical agent memory in `~/.codex/memory/` and progressively disclose machine, repo, and topic packs as needed. Use when Codex needs machine, repo, or cross-repo memory context from the curated memory tree.
 ---
 
 # Memory Skill
