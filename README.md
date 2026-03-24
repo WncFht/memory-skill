@@ -1,9 +1,9 @@
 # Memory Skill
 
-A Codex skill that maintains canonical agent memory in `~/.codex/memory/`
-instead of ad hoc per-repo notes. It keeps the memory repo synchronized before
-reads, routes durable knowledge into machine, repo, and topic packs, and
-publishes memory updates immediately after writes.
+A Codex skill that owns the runtime for agent memory repos. It can initialize a
+new memory repo, adopt an existing one, resolve the active memory root from
+flags, environment, or local state, and keep the repo synchronized before reads
+and after writes.
 
 ## Install
 
@@ -14,18 +14,41 @@ git clone git@github.com:WncFht/memory-skill.git ~/.codex/skills/memory-skill
 If you are replacing an older local install under another folder name, remove
 that directory first so Codex only sees one active copy of the skill.
 
+## First-Run Setup
+
+Create or bind a memory repo before the first sync:
+
+```bash
+~/.codex/skills/memory-skill/scripts/init-memory.sh --memory-root ~/.codex/memory
+```
+
+Use a different path if you do not want the repo under `~/.codex/memory`. The
+skill saves the active root in `~/.codex/state/memory-skill/state.json`.
+
 ## How It Works
 
 1. Before the first memory read in a task, the skill runs
-   `~/.codex/memory/scripts/sync-memory.sh pre-read`.
+   `~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read`.
 2. The agent reads the smallest useful set of memory packs first:
    `core.md`, the current machine summary, and the current repo summary when it
    resolves cleanly.
 3. During work, the agent writes durable findings back to the smallest useful
-   scope under `~/.codex/memory/`.
+   scope under the active memory root.
 4. After editing memory, the skill runs
-   `~/.codex/memory/scripts/sync-memory.sh post-write` to commit, rebase, and
-   push the updates.
+   `~/.codex/skills/memory-skill/scripts/sync-memory.sh post-write` to commit,
+   sync, and publish the updates when a remote is configured.
+
+## Supported Entrypoints
+
+- `scripts/init-memory.sh`
+- `scripts/init-memory.cmd`
+- `scripts/init-memory.ps1`
+- `scripts/sync-memory.sh`
+- `scripts/sync-memory.cmd`
+- `scripts/sync-memory.ps1`
+
+The wrappers all delegate to the same Python runtime so behavior stays aligned
+across Windows, Linux, and macOS.
 
 ## Memory Layout
 
@@ -33,8 +56,7 @@ that directory first so Codex only sees one active copy of the skill.
 - `machines/`: host-specific summaries and repo path maps
 - `repos/`: repo entrypoints and detail packs
 - `topics/`: cross-repo knowledge such as networking or `chezmoi`
-- `scripts/sync-memory.sh`: the shared sync helper used before reads and after
-  writes
+- local state: `~/.codex/state/memory-skill/state.json`
 
 ## What Belongs In Memory
 

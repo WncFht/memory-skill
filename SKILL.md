@@ -1,21 +1,21 @@
 ---
 name: memory-skill
-description: Use when starting a session or when Codex needs machine, repo, or cross-repo context from the curated memory tree in `~/.codex/memory/`.
+description: Use when starting a session or when Codex needs machine, repo, or cross-repo context from the curated memory repo managed by `memory-skill`.
 ---
 
 # Memory Skill
 
-You maintain agent-wide curated memory in `~/.codex/memory/`, not per-repo
-notes and not a chronological log. Read the smallest relevant set of memory
-packs first, then expand only when the task needs more detail.
+You maintain agent-wide curated memory in an active memory repo managed by
+`memory-skill`, not per-repo notes and not a chronological log. Read the
+smallest relevant set of memory packs first, then expand only when the task
+needs more detail.
 
-## Canonical Root
+## Active Memory Root
 
-All memory lives under `~/.codex/memory/`.
+Memory lives in the currently resolved memory root.
 
 - `core.md`: always-read shared memory
 - `rules.md`: write-back and curation policy
-- `scripts/sync-memory.sh`: sync helper for pre-read and post-write git flow
 - `machines/index.md`: machine resolution
 - `machines/<machine-id>/summary.md`: machine-specific memory
 - `machines/<machine-id>/repo-paths.md`: local path to repo-id mappings
@@ -26,18 +26,38 @@ All memory lives under `~/.codex/memory/`.
 
 Index files are routing tables. Memory packs are curated notes.
 
+## Runtime Entrypoints
+
+Use the skill-owned commands instead of running scripts from inside the memory
+repo:
+
+- `~/.codex/skills/memory-skill/scripts/init-memory.sh`
+- `~/.codex/skills/memory-skill/scripts/sync-memory.sh`
+
+The active memory root resolves in this order:
+
+1. `--memory-root <path>`
+2. `MEMORY_ROOT`
+3. `~/.codex/state/memory-skill/state.json`
+4. default `~/.codex/memory`
+
+If no valid memory repo exists yet, initialize or adopt one before attempting
+to read memory.
+
 ## Session Bootstrap
 
 At session start, before the first user-facing response:
 
 1. Before relying on any memory file, run
-   `~/.codex/memory/scripts/sync-memory.sh pre-read`.
-2. Read `~/.codex/memory/core.md` and apply it silently.
-3. Resolve the current machine through `~/.codex/memory/machines/index.md`.
-4. Read the matching machine summary.
-5. If the current working directory belongs to a known repo, resolve the repo
+   `~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read`.
+2. If that fails because no valid memory repo exists yet, create or bind one
+   with `~/.codex/skills/memory-skill/scripts/init-memory.sh --memory-root <path>`.
+3. Read the resolved memory repo's `core.md` and apply it silently.
+4. Resolve the current machine through `machines/index.md`.
+5. Read the matching machine summary.
+6. If the current working directory belongs to a known repo, resolve the repo
    id and read that repo's `summary.md`.
-6. Do not bulk-read topic packs or repo detail packs during startup bootstrap.
+7. Do not bulk-read topic packs or repo detail packs during startup bootstrap.
 
 Do not announce that you read memory. Just apply what you learn.
 
@@ -48,7 +68,7 @@ if it were current.
 ## Read Rounds
 
 Before each new round of memory reads, run
-`~/.codex/memory/scripts/sync-memory.sh pre-read` once.
+`~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read` once.
 
 A read round may open multiple relevant memory files from the synchronized
 snapshot. Do not rerun `pre-read` for every file in the same round.
@@ -59,8 +79,8 @@ published.
 
 ## Machine Resolution
 
-Resolve the machine first. Use `~/.codex/memory/machines/index.md` to map the
-current host to a machine id.
+Resolve the machine first. Use `machines/index.md` inside the active memory root
+to map the current host to a machine id.
 
 After resolving the machine id:
 
@@ -75,7 +95,7 @@ post-write sync.
 
 ## Repo Resolution
 
-Repo memory is stored only under `~/.codex/memory/repos/`.
+Repo memory is stored only under `repos/` inside the active memory root.
 
 To resolve the current repo:
 
@@ -129,9 +149,9 @@ and promotion or demotion between packs.
 A write batch may update multiple memory files that belong to the same logical
 memory update.
 
-After editing any file under `~/.codex/memory/` for that batch, immediately run
-`~/.codex/memory/scripts/sync-memory.sh post-write` once to commit, rebase, and
-push the batch.
+After editing any file under the active memory root for that batch, immediately
+run `~/.codex/skills/memory-skill/scripts/sync-memory.sh post-write` once to
+commit, sync, and publish the batch when a remote is configured.
 
 Do not leave local memory edits unpublished between batches. Use the default
 commit message unless the change clearly deserves a more specific one via `-m`.
