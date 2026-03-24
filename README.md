@@ -5,6 +5,8 @@ new memory repo, adopt an existing one, resolve the active memory root from
 flags, environment, or local state, and keep the repo synchronized before reads
 and after writes.
 
+Chinese README: [README.zh-CN.md](./README.zh-CN.md)
+
 ## Install
 
 ```bash
