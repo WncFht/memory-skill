@@ -1,6 +1,6 @@
 ---
 name: memory-skill
-description: Use when Codex needs machine, repo, or cross-repo context from the curated memory tree in `~/.codex/memory/`.
+description: Use when starting a session or when Codex needs machine, repo, or cross-repo context from the curated memory tree in `~/.codex/memory/`.
 ---
 
 # Memory Skill
@@ -26,9 +26,9 @@ All memory lives under `~/.codex/memory/`.
 
 Index files are routing tables. Memory packs are curated notes.
 
-## Before First Memory Read
+## Session Bootstrap
 
-Before relying on memory for a task:
+At session start, before the first user-facing response:
 
 1. Before relying on any memory file, run
    `~/.codex/memory/scripts/sync-memory.sh pre-read`.
@@ -37,13 +37,25 @@ Before relying on memory for a task:
 4. Read the matching machine summary.
 5. If the current working directory belongs to a known repo, resolve the repo
    id and read that repo's `summary.md`.
-6. Do not bulk-read topic packs or repo detail packs during initial loading.
+6. Do not bulk-read topic packs or repo detail packs during startup bootstrap.
 
 Do not announce that you read memory. Just apply what you learn.
 
 If the sync helper fails, stop and surface the reason. Do not auto-stash local
 changes, do not silently skip the sync, and do not read known-stale memory as
 if it were current.
+
+## Read Rounds
+
+Before each new round of memory reads, run
+`~/.codex/memory/scripts/sync-memory.sh pre-read` once.
+
+A read round may open multiple relevant memory files from the synchronized
+snapshot. Do not rerun `pre-read` for every file in the same round.
+
+Start a new read round when you return to memory after doing other work, when
+the task shifts to a different memory question, or after a write batch has been
+published.
 
 ## Machine Resolution
 
@@ -95,9 +107,9 @@ Only expand additional packs when needed:
 
 Never load the whole memory tree just because it exists.
 
-Run the pre-read sync once before the first memory read in a task, then read as
-many relevant packs as needed from that synchronized snapshot. Run it again
-only after you have written memory or when fresh remote edits are likely.
+Within one read round, open as many relevant packs as needed from that
+synchronized snapshot. Start a new read round before reading memory again after
+later task changes or after a write batch.
 
 ## Continuous Updates
 
@@ -112,10 +124,17 @@ Route new memory to the smallest durable scope that fits:
 Use `rules.md` for curation policy, scope decisions, summary-vs-detail rules,
 and promotion or demotion between packs.
 
-After editing any file under `~/.codex/memory/`, immediately run
-`~/.codex/memory/scripts/sync-memory.sh post-write`.
-Use the default commit message unless the change clearly deserves a more
-specific one via `-m`.
+## Write Batches
+
+A write batch may update multiple memory files that belong to the same logical
+memory update.
+
+After editing any file under `~/.codex/memory/` for that batch, immediately run
+`~/.codex/memory/scripts/sync-memory.sh post-write` once to commit, rebase, and
+push the batch.
+
+Do not leave local memory edits unpublished between batches. Use the default
+commit message unless the change clearly deserves a more specific one via `-m`.
 
 ## Practical Rule
 
