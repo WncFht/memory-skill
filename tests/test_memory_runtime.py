@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_PATH = ROOT / "runtime" / "memory_runtime.py"
+RUNTIME_SPEC = importlib.util.spec_from_file_location("memory_runtime", RUNTIME_PATH)
+assert RUNTIME_SPEC is not None and RUNTIME_SPEC.loader is not None
+memory_runtime = importlib.util.module_from_spec(RUNTIME_SPEC)
+sys.modules[RUNTIME_SPEC.name] = memory_runtime
+RUNTIME_SPEC.loader.exec_module(memory_runtime)
 SYNC_WRAPPER = ROOT / "scripts" / "sync-memory.sh"
 INIT_WRAPPER = ROOT / "scripts" / "init-memory.sh"
 SYNC_CMD = ROOT / "scripts" / "sync-memory.cmd"
@@ -46,6 +55,8 @@ class MemoryRuntimeTests(unittest.TestCase):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.home_dir = self.temp_dir / "home"
         self.home_dir.mkdir()
+        run(["git", "config", "--global", "user.name", "memory-skill test"], env=self.env())
+        run(["git", "config", "--global", "user.email", "memory-skill@example.invalid"], env=self.env())
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -216,6 +227,138 @@ class MemoryRuntimeTests(unittest.TestCase):
         self.assertEqual(sync_help.returncode, 0, sync_help.stderr)
         self.assertIn("usage:", init_help.stdout)
         self.assertIn("usage:", sync_help.stdout)
+
+    def test_github_https_url_parses_common_remote_forms(self) -> None:
+        self.assertEqual(
+            memory_runtime.github_https_url("git@github.com:WncFht/agent-memory.git"),
+            "https://github.com/WncFht/agent-memory.git",
+        )
+        self.assertEqual(
+            memory_runtime.github_https_url("ssh://git@ssh.github.com:443/WncFht/agent-memory.git"),
+            "https://github.com/WncFht/agent-memory.git",
+        )
+        self.assertEqual(
+            memory_runtime.github_https_url("https://github.com/WncFht/agent-memory.git"),
+            "https://github.com/WncFht/agent-memory.git",
+        )
+        self.assertIsNone(memory_runtime.github_https_url("git@gitlab.com:org/repo.git"))
+
+    def test_github_token_prefers_memory_specific_env(self) -> None:
+        token, source = memory_runtime.github_token(
+            {
+                "GITHUB_TOKEN": "global-token",
+                "MEMORY_SYNC_GITHUB_TOKEN": "memory-token",
+            }
+        )
+        self.assertEqual(token, "memory-token")
+        self.assertEqual(source, "MEMORY_SYNC_GITHUB_TOKEN")
+
+    def test_socks_proxy_url_prefers_explicit_env(self) -> None:
+        proxy = memory_runtime.socks_proxy_url({"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"})
+        self.assertEqual(proxy, "socks5://127.0.0.1:7897")
+
+    def test_git_runtime_env_builds_git_ssh_command_for_socks_proxy(self) -> None:
+        env = memory_runtime.git_runtime_env({"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"})
+        self.assertEqual(env["ALL_PROXY"], "socks5://127.0.0.1:7897")
+        self.assertIn("ssh_via_socks.py", env["GIT_SSH_COMMAND"])
+        self.assertIn("socks5://127.0.0.1:7897", env["GIT_SSH_COMMAND"])
+
+    def test_fetch_remote_tries_github_https_fallback_after_ssh_failure(self) -> None:
+        calls: list[list[str]] = []
+        ssh_failure = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            128,
+            "",
+            "Connection closed by 20.27.177.118 port 443",
+        )
+        https_success = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            0,
+            "",
+            "",
+        )
+
+        def fake_run_git(args: list[str], *, cwd: Path, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args == ["fetch", "--quiet", "origin"]:
+                return ssh_failure
+            if args[-3:] == ["fetch", "--quiet", "origin"] and any(
+                part == "remote.origin.url=https://github.com/WncFht/agent-memory.git" for part in args
+            ):
+                return https_success
+            raise AssertionError(f"Unexpected git args: {args}")
+
+        with (
+            mock.patch.object(
+                memory_runtime,
+                "remote_execution_plans",
+                return_value=[
+                    memory_runtime.RemoteExecutionPlan(label="configured remote `origin`"),
+                    memory_runtime.RemoteExecutionPlan(
+                        label="GitHub HTTPS fallback",
+                        prefix_args=(
+                            "-c",
+                            "remote.origin.url=https://github.com/WncFht/agent-memory.git",
+                            "-c",
+                            "http.extraHeader=Authorization: Basic dGVzdA==",
+                        ),
+                    ),
+                ],
+            ),
+            mock.patch.object(memory_runtime, "run_git", side_effect=fake_run_git),
+        ):
+            completed, details = memory_runtime.run_git_remote_with_retry(
+                ["fetch", "--quiet", "origin"],
+                cwd=self.temp_dir,
+                remote="origin",
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(any(args == ["fetch", "--quiet", "origin"] for args in calls))
+        self.assertTrue(
+            any(
+                args[-3:] == ["fetch", "--quiet", "origin"]
+                and "remote.origin.url=https://github.com/WncFht/agent-memory.git" in args
+                for args in calls
+            )
+        )
+        self.assertTrue(any("configured remote `origin` attempt 1/3" in detail for detail in details))
+
+    def test_fetch_remote_surfaces_github_token_fix_after_https_auth_failure(self) -> None:
+        memory_root = self.temp_dir / "memory"
+        self.assertEqual(self.init_repo(memory_root).returncode, 0)
+        git(["remote", "add", "origin", "git@github.com:WncFht/agent-memory.git"], cwd=memory_root)
+
+        ssh_failure = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            128,
+            "",
+            "Connection closed by 20.27.177.118 port 443",
+        )
+        https_auth_failure = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            128,
+            "",
+            "HTTP/2 401 Unauthorized\nfatal: could not read Username for 'https://github.com': No such device or address",
+        )
+
+        def fake_run_git(args: list[str], *, cwd: Path, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+            if args[:3] == ["config", "--get", "remote.origin.url"]:
+                return subprocess.CompletedProcess(["git", *args], 0, "git@github.com:WncFht/agent-memory.git\n", "")
+            if args == ["fetch", "--quiet", "origin"]:
+                return ssh_failure
+            if args[-3:] == ["fetch", "--quiet", "origin"] and any(
+                part == "remote.origin.url=https://github.com/WncFht/agent-memory.git" for part in args
+            ):
+                return https_auth_failure
+            raise AssertionError(f"Unexpected git args: {args}")
+
+        with mock.patch.object(memory_runtime, "run_git", side_effect=fake_run_git):
+            with self.assertRaises(memory_runtime.MemoryRuntimeError) as context:
+                memory_runtime.fetch_remote(memory_root, "origin")
+
+        self.assertIn("MEMORY_SYNC_GITHUB_TOKEN", context.exception.fix)
+        self.assertTrue(any("GitHub HTTPS fallback" in detail for detail in context.exception.details))
 
 
 if __name__ == "__main__":

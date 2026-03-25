@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -15,12 +17,14 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 
 DEFAULT_MEMORY_ROOT = Path.home() / ".codex" / "memory"
 STATE_FILE = Path.home() / ".codex" / "state" / "memory-skill" / "state.json"
 TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / "templates" / "memory-tree"
+SOCKS_PROXY_COMMAND = Path(__file__).resolve().with_name("ssh_via_socks.py")
 DEFAULT_COMMIT_MESSAGE = "chore(memory): update memory packs"
 
 
@@ -43,6 +47,41 @@ HEARTBEAT_INTERVAL_SECONDS = env_float("MEMORY_SYNC_HEARTBEAT_SECONDS", 2.0)
 STALE_AFTER_SECONDS = env_float("MEMORY_SYNC_STALE_AFTER_SECONDS", 30.0)
 WAIT_TIMEOUT_SECONDS = env_float("MEMORY_SYNC_WAIT_TIMEOUT_SECONDS", 300.0)
 WAIT_POLL_SECONDS = env_float("MEMORY_SYNC_WAIT_POLL_SECONDS", 0.2)
+REMOTE_RETRY_ATTEMPTS = 3
+REMOTE_RETRY_BASE_DELAY_SECONDS = 1.0
+GITHUB_TOKEN_ENV_VARS = ("MEMORY_SYNC_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+GITHUB_REMOTE_HOSTS = {"github.com", "ssh.github.com"}
+SOCKS_PROXY_ENV_VARS = ("MEMORY_SYNC_SOCKS_PROXY", "ALL_PROXY", "all_proxy")
+DEFAULT_LOCAL_SOCKS_PROXIES = (
+    "socks5://127.0.0.1:7897",
+    "socks5h://127.0.0.1:7891",
+)
+TRANSIENT_REMOTE_ERROR_MARKERS = (
+    "connection closed by",
+    "connection reset by peer",
+    "operation timed out",
+    "timed out",
+    "could not resolve host",
+    "couldn't connect to server",
+    "failed to connect to",
+    "failure when receiving data from the peer",
+    "early eof",
+    "unexpected disconnect",
+    "remote end hung up unexpectedly",
+    "tls connect error",
+    "unexpected eof while reading",
+    "ssh_exchange_identification",
+    "kex_exchange_identification",
+)
+AUTH_REMOTE_ERROR_MARKERS = (
+    "401 unauthorized",
+    "403 forbidden",
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "repository not found",
+    "access denied",
+)
 
 
 @dataclass
@@ -52,6 +91,13 @@ class MemoryRuntimeError(Exception):
     fix: str
     details: list[str] = field(default_factory=list)
     exit_code: int = 1
+
+
+@dataclass(frozen=True)
+class RemoteExecutionPlan:
+    label: str
+    prefix_args: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 class FriendlyArgumentParser(argparse.ArgumentParser):
@@ -212,6 +258,55 @@ def run_command(
     return completed
 
 
+def local_tcp_listener(host: str, port: int, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def proxy_host_port(proxy_url: str) -> tuple[str, int] | None:
+    parsed = urlsplit(proxy_url)
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        return None
+    return host, port
+
+
+def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
+    source = env or os.environ
+    for name in SOCKS_PROXY_ENV_VARS:
+        value = source.get(name)
+        if value and value.strip().lower().startswith(("socks5://", "socks5h://")):
+            return value.strip()
+    if source.get("MEMORY_SYNC_DISABLE_LOCAL_PROXY_AUTODETECT") == "1":
+        return None
+    for candidate in DEFAULT_LOCAL_SOCKS_PROXIES:
+        host_port = proxy_host_port(candidate)
+        if host_port and local_tcp_listener(*host_port):
+            return candidate
+    return None
+
+
+def git_runtime_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+
+    proxy_url = socks_proxy_url(merged)
+    if proxy_url:
+        merged.setdefault("ALL_PROXY", proxy_url)
+        merged.setdefault("all_proxy", proxy_url)
+        if "GIT_SSH_COMMAND" not in merged and SOCKS_PROXY_COMMAND.is_file():
+            python_bin = shutil.which("python3") or shutil.which("python") or sys.executable
+            proxy_command = shlex.join([python_bin, str(SOCKS_PROXY_COMMAND), "--proxy", proxy_url, "%h", "%p"])
+            merged["GIT_SSH_COMMAND"] = shlex.join(["ssh", "-o", f"ProxyCommand={proxy_command}"])
+
+    return merged
+
+
 def run_git(
     args: list[str],
     *,
@@ -219,7 +314,11 @@ def run_git(
     env: dict[str, str] | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(["git", *args], cwd=cwd, env=env, capture_output=True, check=check)
+    return run_command(["git", *args], cwd=cwd, env=git_runtime_env(env), capture_output=True, check=check)
+
+
+def command_output(completed: subprocess.CompletedProcess[str]) -> str:
+    return (completed.stderr or completed.stdout or "").strip()
 
 
 def git_output(args: list[str], *, cwd: Path) -> str:
@@ -278,6 +377,139 @@ def preferred_remote(root: Path) -> str | None:
     if len(remotes) == 1:
         return remotes[0]
     return None
+
+
+def git_config_value(root: Path, key: str) -> str | None:
+    completed = run_git(["config", "--get", key], cwd=root, check=False)
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value:
+        return None
+    return value
+
+
+def remote_url(root: Path, remote: str) -> str | None:
+    return git_config_value(root, f"remote.{remote}.url")
+
+
+def remote_push_url(root: Path, remote: str) -> str | None:
+    return git_config_value(root, f"remote.{remote}.pushurl") or remote_url(root, remote)
+
+
+def split_git_remote_url(remote_url: str) -> tuple[str, str] | None:
+    value = remote_url.strip()
+    if not value:
+        return None
+    if "://" in value:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").strip().lower()
+        path = parsed.path.lstrip("/")
+        if host and path:
+            return host, path
+        return None
+    if ":" in value and "@" in value.split(":", 1)[0]:
+        user_host, path = value.split(":", 1)
+        if "@" not in user_host:
+            return None
+        _user, host = user_host.rsplit("@", 1)
+        host = host.strip().lower()
+        path = path.lstrip("/")
+        if host and path:
+            return host, path
+    return None
+
+
+def github_https_url(remote_url: str) -> str | None:
+    parsed = split_git_remote_url(remote_url)
+    if not parsed:
+        return None
+    host, repo_path = parsed
+    if host not in GITHUB_REMOTE_HOSTS:
+        return None
+    return f"https://github.com/{repo_path}"
+
+
+def github_token(env: Mapping[str, str] | None = None) -> tuple[str | None, str | None]:
+    source = env or os.environ
+    for name in GITHUB_TOKEN_ENV_VARS:
+        value = source.get(name)
+        if value and value.strip():
+            return value.strip(), name
+    return None, None
+
+
+def github_http_extra_header(token: str) -> str:
+    payload = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    return f"Authorization: Basic {payload}"
+
+
+def is_auth_remote_failure(output: str) -> bool:
+    lowered = output.lower()
+    return any(marker in lowered for marker in AUTH_REMOTE_ERROR_MARKERS)
+
+
+def remote_execution_plans(root: Path, remote: str, *, push: bool) -> list[RemoteExecutionPlan]:
+    source_url = remote_push_url(root, remote) if push else remote_url(root, remote)
+    if not source_url:
+        return [RemoteExecutionPlan(label=f"configured remote `{remote}`")]
+
+    https_url = github_https_url(source_url)
+    token, token_name = github_token()
+
+    plans = [RemoteExecutionPlan(label=f"configured remote `{remote}`")]
+    if not https_url:
+        return plans
+
+    prefix: list[str] = []
+    notes: list[str] = [f"GitHub HTTPS target: {https_url}"]
+    if source_url != https_url:
+        prefix.extend(["-c", f"remote.{remote}.url={https_url}"])
+        notes.append("Transport override: alternate remote URL -> HTTPS")
+    if push and source_url != https_url:
+        prefix.extend(["-c", f"remote.{remote}.pushurl={https_url}"])
+    if token:
+        prefix.extend(["-c", f"http.extraHeader={github_http_extra_header(token)}"])
+        notes.append(f"Authentication source: ${token_name}")
+    else:
+        notes.append("Authentication source: none")
+
+    if prefix:
+        plans.append(
+            RemoteExecutionPlan(
+                label="GitHub HTTPS fallback",
+                prefix_args=tuple(prefix),
+                notes=tuple(notes),
+            )
+        )
+    return plans
+
+
+def remote_failure_fix(root: Path, remote: str, *, push: bool, output: str) -> str:
+    source_url = remote_push_url(root, remote) if push else remote_url(root, remote)
+    https_url = github_https_url(source_url or "")
+    token, token_name = github_token()
+    if not https_url:
+        return "Check network access, remote reachability, and credentials, then retry the sync command."
+
+    if token:
+        return (
+            f"GitHub HTTPS is reachable, but the configured token from `{token_name}` could not complete the "
+            f"{'push' if push else 'fetch'}. Verify that the token still has access to `{https_url}`, or "
+            "configure a git credential helper."
+        )
+
+    if is_auth_remote_failure(output):
+        return (
+            "SSH access to GitHub is unavailable on this machine, and the HTTPS fallback reached GitHub but "
+            "did not have credentials for the private repo. Export one of "
+            f"{', '.join(f'`{name}`' for name in GITHUB_TOKEN_ENV_VARS)} or configure a git credential helper, "
+            "then retry."
+        )
+
+    return (
+        "The configured GitHub remote could not be reached over its current transport. Check SSH reachability "
+        "to GitHub, or export one of "
+        f"{', '.join(f'`{name}`' for name in GITHUB_TOKEN_ENV_VARS)} so the runtime can retry over HTTPS."
+    )
 
 
 def has_unresolved_conflicts(root: Path) -> bool:
@@ -574,15 +806,51 @@ class RepoLock:
         self.release()
 
 
+def is_transient_remote_failure(output: str) -> bool:
+    lowered = output.lower()
+    return any(marker in lowered for marker in TRANSIENT_REMOTE_ERROR_MARKERS)
+
+
+def run_git_remote_with_retry(
+    args: list[str],
+    *,
+    cwd: Path,
+    remote: str | None = None,
+    push: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    plans = [RemoteExecutionPlan(label="configured remote")]
+    if remote:
+        plans = remote_execution_plans(cwd, remote, push=push)
+
+    attempt_details: list[str] = []
+    completed: subprocess.CompletedProcess[str] | None = None
+    for plan in plans:
+        if plan.notes:
+            attempt_details.extend(f"{plan.label}: {note}" for note in plan.notes)
+        for attempt in range(1, REMOTE_RETRY_ATTEMPTS + 1):
+            completed = run_git([*plan.prefix_args, *args], cwd=cwd, check=False)
+            if completed.returncode == 0:
+                return completed, attempt_details
+
+            output = command_output(completed)
+            detail = output or f"git {' '.join(args)} exited with code {completed.returncode}."
+            attempt_details.append(f"{plan.label} attempt {attempt}/{REMOTE_RETRY_ATTEMPTS}: {detail}")
+            if attempt >= REMOTE_RETRY_ATTEMPTS or not is_transient_remote_failure(output):
+                break
+            time.sleep(REMOTE_RETRY_BASE_DELAY_SECONDS * attempt)
+
+    assert completed is not None
+    return completed, attempt_details
+
+
 def fetch_remote(root: Path, remote: str) -> None:
-    completed = run_git(["fetch", "--quiet", remote], cwd=root, check=False)
+    completed, attempts = run_git_remote_with_retry(["fetch", "--quiet", remote], cwd=root, remote=remote)
     if completed.returncode != 0:
-        output = (completed.stderr or completed.stdout or "").strip()
         raise MemoryRuntimeError(
             what=f"Fetching from `{remote}` failed for `{root}`.",
             why="The memory repo could not refresh remote state before syncing.",
-            fix="Check network access, remote reachability, and credentials, then retry the sync command.",
-            details=[output] if output else [],
+            fix=remote_failure_fix(root, remote, push=False, output=command_output(completed)),
+            details=attempts or [command_output(completed)],
         )
 
 
@@ -615,14 +883,13 @@ def push_branch(root: Path, remote: str, branch: str, set_upstream: bool = False
     if set_upstream:
         args.append("-u")
     args.extend([remote, f"HEAD:{branch}"])
-    completed = run_git(args, cwd=root, check=False)
+    completed, attempts = run_git_remote_with_retry(args, cwd=root, remote=remote, push=True)
     if completed.returncode != 0:
-        output = (completed.stderr or completed.stdout or "").strip()
         raise MemoryRuntimeError(
             what=f"Pushing branch `{branch}` to `{remote}` failed for `{root}`.",
             why="The runtime could not publish memory updates to the configured remote.",
-            fix="Check the remote branch state, credentials, and network connectivity, then retry `post-write`.",
-            details=[output] if output else [],
+            fix=remote_failure_fix(root, remote, push=True, output=command_output(completed)),
+            details=attempts or [command_output(completed)],
         )
 
 

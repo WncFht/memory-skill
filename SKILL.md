@@ -5,34 +5,18 @@ description: Use when starting a session or when Codex needs machine, repo, or c
 
 # Memory Skill
 
-You maintain agent-wide curated memory in an active memory repo managed by
-`memory-skill`, not per-repo notes and not a chronological log. Read the
-smallest relevant set of memory packs first, then expand only when the task
-needs more detail.
+You maintain curated, reusable agent memory in an active memory repo managed by
+`memory-skill`. This is not per-repo scratch space, not a chronological log,
+and not a place to dump temporary state.
 
-## Active Memory Root
+## Runtime Contract
 
-Memory lives in the currently resolved memory root.
-
-- `core.md`: always-read shared memory
-- `rules.md`: write-back and curation policy
-- `machines/index.md`: machine resolution
-- `machines/<machine-id>/summary.md`: machine-specific memory
-- `machines/<machine-id>/repo-paths.md`: local path to repo-id mappings
-- `repos/index.md`: canonical repo identities
-- `repos/<repo-id>/summary.md`: repo entrypoint
-- `repos/<repo-id>/*.md`: repo detail packs
-- `topics/<topic>.md`: cross-repo topic packs
-
-Index files are routing tables. Memory packs are curated notes.
-
-## Runtime Entrypoints
-
-Use the skill-owned commands instead of running scripts from inside the memory
-repo:
+Always use the skill-owned entrypoints:
 
 - `~/.codex/skills/memory-skill/scripts/init-memory.sh`
 - `~/.codex/skills/memory-skill/scripts/sync-memory.sh`
+
+Do not improvise your own sync sequence inside the memory repo.
 
 The active memory root resolves in this order:
 
@@ -41,8 +25,21 @@ The active memory root resolves in this order:
 3. `~/.codex/state/memory-skill/state.json`
 4. default `~/.codex/memory`
 
-If no valid memory repo exists yet, initialize or adopt one before attempting
-to read memory.
+## What Lives In Memory
+
+Memory lives inside the resolved memory root.
+
+- `core.md`: shared defaults
+- `rules.md`: curation policy
+- `machines/index.md`: machine routing
+- `machines/<machine-id>/summary.md`: machine-specific context
+- `machines/<machine-id>/repo-paths.md`: local path to repo-id routing
+- `repos/index.md`: canonical repo identities
+- `repos/<repo-id>/summary.md`: repo entrypoint
+- `repos/<repo-id>/*.md`: repo detail packs
+- `topics/<topic>.md`: cross-repo topic packs
+
+Index files route lookups. Packs hold curated knowledge.
 
 ## Session Bootstrap
 
@@ -50,113 +47,128 @@ At session start, before the first user-facing response:
 
 1. Before relying on any memory file, run
    `~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read`.
-2. If that fails because no valid memory repo exists yet, create or bind one
-   with `~/.codex/skills/memory-skill/scripts/init-memory.sh --memory-root <path>`.
-3. Read the resolved memory repo's `core.md` and apply it silently.
-4. Resolve the current machine through `machines/index.md`.
-5. Read the matching machine summary.
-6. If the current working directory belongs to a known repo, resolve the repo
-   id and read that repo's `summary.md`.
-7. Do not bulk-read topic packs or repo detail packs during startup bootstrap.
+2. If that fails because no valid memory repo exists yet, initialize or adopt
+   one with `~/.codex/skills/memory-skill/scripts/init-memory.sh --memory-root <path>`.
+3. If sync fails for any other reason, stop and surface the reason.
+4. Read the resolved repo's `core.md`.
+5. Resolve the current machine through `machines/index.md`.
+6. Read the matching machine summary.
+7. If the current working directory maps to a known repo, read that repo's
+   `summary.md`.
 
-Do not announce that you read memory. Just apply what you learn.
-
-If the sync helper fails, stop and surface the reason. Do not auto-stash local
-changes, do not silently skip the sync, and do not read known-stale memory as
-if it were current.
+Do not announce that memory was read. Just apply it.
 
 ## Read Rounds
 
-Before each new round of memory reads, run
-`~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read` once.
+Treat memory access as read rounds.
 
-A read round may open multiple relevant memory files from the synchronized
-snapshot. Do not rerun `pre-read` for every file in the same round.
+- Run `pre-read` once at the start of a round.
+- Read as many relevant files as needed from that synchronized snapshot.
+- Do not rerun `pre-read` for every single file.
 
-Start a new read round when you return to memory after doing other work, when
-the task shifts to a different memory question, or after a write batch has been
-published.
+Start a new read round when:
 
-## Machine Resolution
-
-Resolve the machine first. Use `machines/index.md` inside the active memory root
-to map the current host to a machine id.
-
-After resolving the machine id:
-
-- Read `machines/<machine-id>/summary.md`.
-- Use `machines/<machine-id>/repo-paths.md` when you need to map the current
-  working directory to a repo id.
-
-If the current machine is missing, continue without machine memory until you
-have durable machine-specific facts worth recording. When you do create a new
-machine pack, add both `summary.md` and `repo-paths.md`, then run the required
-post-write sync.
-
-## Repo Resolution
-
-Repo memory is stored only under `repos/` inside the active memory root.
-
-To resolve the current repo:
-
-1. Prefer exact or longest-parent-prefix path matches from the current
-   machine's `repo-paths.md`.
-2. If no path match exists and you are inside a git repo, use git metadata to
-   match an existing repo entry in `repos/index.md`.
-3. If the repo is still unknown, work without repo memory until you have enough
-   stable information to create a new repo pack.
-
-Never write repo memory back into the repo itself.
+- you return to memory after doing other work
+- the task shifts to a different memory question
+- you need memory again after publishing a write batch
 
 ## Progressive Disclosure
 
-Read the minimum useful set of files first:
+Start with the minimum useful set:
 
 - `core.md`
-- the current machine summary
-- the current repo summary, if resolved
+- current machine summary
+- current repo summary, if resolved
 
-Only expand additional packs when needed:
+Only expand when the task truly needs it:
 
-- Read a topic pack when the task involves that tool, platform, workflow, or
-  failure mode.
-- Read a repo detail pack when the repo summary points to it or the task is
-  clearly about that area.
-- Prefer reading one additional file at a time.
-- Stop expanding once you have enough context to proceed reliably.
+- read a topic pack for a tool, platform, or recurring failure mode
+- read a repo detail pack when the repo summary points to it
+- prefer opening one additional file at a time
 
-Never load the whole memory tree just because it exists.
+Never bulk-read the whole memory tree just because it exists.
 
-Within one read round, open as many relevant packs as needed from that
-synchronized snapshot. Start a new read round before reading memory again after
-later task changes or after a write batch.
+## Machine Resolution
 
-## Continuous Updates
+Resolve the machine first through `machines/index.md`.
 
-Update memory during work whenever you learn something durable and reusable.
-Route new memory to the smallest durable scope that fits:
+After resolving the machine id:
 
-- `core.md`: defaults that should affect most sessions
-- `topics/<topic>.md`: cross-repo knowledge for a specific tool or theme
-- `machines/<machine-id>/summary.md`: machine-specific facts and rules
-- `repos/<repo-id>/*.md`: repo-specific memory
+- read `machines/<machine-id>/summary.md`
+- use `machines/<machine-id>/repo-paths.md` to map the current working
+  directory to a repo id when needed
 
-Use `rules.md` for curation policy, scope decisions, summary-vs-detail rules,
-and promotion or demotion between packs.
+If the machine has no entry yet, continue without machine memory until you have
+durable facts worth recording.
+
+## Repo Resolution
+
+Repo memory lives only under `repos/` in the memory repo.
+
+Resolve the current repo in this order:
+
+1. exact or longest-parent-prefix path matches from the current machine's
+   `repo-paths.md`
+2. if still unresolved and you are inside a git repo, use git metadata to match
+   an existing entry in `repos/index.md`
+3. if still unknown, continue without repo memory until you have enough stable
+   information to create a pack
+
+Never write repo memory back into the target repo itself.
 
 ## Write Batches
 
-A write batch may update multiple memory files that belong to the same logical
-memory update.
+Treat memory updates as write batches.
 
-After editing any file under the active memory root for that batch, immediately
-run `~/.codex/skills/memory-skill/scripts/sync-memory.sh post-write` once to
-commit, sync, and publish the batch when a remote is configured.
+- A write batch may touch multiple memory files that belong to the same logical
+  update.
+- After editing any memory file in that batch, run
+  `~/.codex/skills/memory-skill/scripts/sync-memory.sh post-write` once.
+- Do not leave local memory edits unpublished between batches.
 
-Do not leave local memory edits unpublished between batches. Use the default
-commit message unless the change clearly deserves a more specific one via `-m`.
+Use the default commit message unless the update clearly deserves a more
+specific `-m`.
+
+## What Is Worth Writing Back
+
+Write only durable, reusable information:
+
+- stable user preferences
+- machine-specific environment facts
+- repo workflows that will recur
+- cross-repo operational knowledge
+
+Do not write:
+
+- one-off timelines
+- verbose logs
+- speculative notes without future reuse value
+- transient working state that belongs in the current task, not memory
+
+## Failure Handling
+
+If sync fails:
+
+- do not auto-stash changes
+- do not silently skip sync
+- do not read known-stale memory as if it were current
+
+Surface the failure clearly and stop, unless the only problem is that no valid
+memory repo exists yet and you can initialize or adopt one safely.
+
+## Network And Auth Note
+
+The runtime is proxy-aware and can help with GitHub sync on difficult networks.
+
+- It may use `MEMORY_SYNC_SOCKS_PROXY`, `ALL_PROXY`, or `all_proxy`.
+- It may auto-detect common local SOCKS endpoints.
+- For GitHub remotes, it can use token-backed HTTPS fallback via
+  `MEMORY_SYNC_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN`.
+
+Those capabilities help the runtime sync successfully, but your instruction as
+the agent does not change: if sync still fails, stop and surface the reason.
 
 ## Practical Rule
 
-Think of memory-skill as a live agent memory system for future execution speed and
-reliability. It is not a history file and it is not a dumping ground.
+Treat `memory-skill` as a live memory system optimized for future execution
+speed and reliability. Keep it small, trustworthy, and publishable.
