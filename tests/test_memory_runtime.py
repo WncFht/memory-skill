@@ -263,6 +263,14 @@ class MemoryRuntimeTests(unittest.TestCase):
         self.assertIn("ssh_via_socks.py", env["GIT_SSH_COMMAND"])
         self.assertIn("socks5://127.0.0.1:7897", env["GIT_SSH_COMMAND"])
 
+    def test_git_runtime_env_omits_git_ssh_command_when_disabled(self) -> None:
+        env = memory_runtime.git_runtime_env(
+            {"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"},
+            include_ssh_proxy_command=False,
+        )
+        self.assertEqual(env["ALL_PROXY"], "socks5://127.0.0.1:7897")
+        self.assertNotIn("GIT_SSH_COMMAND", env)
+
     def test_fetch_remote_tries_github_https_fallback_after_ssh_failure(self) -> None:
         calls: list[list[str]] = []
         ssh_failure = subprocess.CompletedProcess(
@@ -278,8 +286,15 @@ class MemoryRuntimeTests(unittest.TestCase):
             "",
         )
 
-        def fake_run_git(args: list[str], *, cwd: Path, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-            calls.append(args)
+        def fake_run_git(
+            args: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str] | None = None,
+            include_ssh_proxy_command: bool = True,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append([*args, f"include_ssh_proxy_command={include_ssh_proxy_command}"])
             if args == ["fetch", "--quiet", "origin"]:
                 return ssh_failure
             if args[-3:] == ["fetch", "--quiet", "origin"] and any(
@@ -302,6 +317,7 @@ class MemoryRuntimeTests(unittest.TestCase):
                             "-c",
                             "http.extraHeader=Authorization: Basic dGVzdA==",
                         ),
+                        include_ssh_proxy_command=False,
                     ),
                 ],
             ),
@@ -314,14 +330,15 @@ class MemoryRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0)
-        self.assertTrue(any(args == ["fetch", "--quiet", "origin"] for args in calls))
+        self.assertTrue(any(args[:-1] == ["fetch", "--quiet", "origin"] for args in calls))
         self.assertTrue(
             any(
-                args[-3:] == ["fetch", "--quiet", "origin"]
+                args[-4:-1] == ["fetch", "--quiet", "origin"]
                 and "remote.origin.url=https://github.com/WncFht/agent-memory.git" in args
                 for args in calls
             )
         )
+        self.assertTrue(any(args[-1] == "include_ssh_proxy_command=False" for args in calls if "remote.origin.url=https://github.com/WncFht/agent-memory.git" in args))
         self.assertTrue(any("configured remote `origin` attempt 1/3" in detail for detail in details))
 
     def test_fetch_remote_surfaces_github_token_fix_after_https_auth_failure(self) -> None:
@@ -342,7 +359,14 @@ class MemoryRuntimeTests(unittest.TestCase):
             "HTTP/2 401 Unauthorized\nfatal: could not read Username for 'https://github.com': No such device or address",
         )
 
-        def fake_run_git(args: list[str], *, cwd: Path, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+        def fake_run_git(
+            args: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str] | None = None,
+            include_ssh_proxy_command: bool = True,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
             if args[:3] == ["config", "--get", "remote.origin.url"]:
                 return subprocess.CompletedProcess(["git", *args], 0, "git@github.com:WncFht/agent-memory.git\n", "")
             if args == ["fetch", "--quiet", "origin"]:

@@ -98,6 +98,7 @@ class RemoteExecutionPlan:
     label: str
     prefix_args: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    include_ssh_proxy_command: bool = True
 
 
 class FriendlyArgumentParser(argparse.ArgumentParser):
@@ -290,7 +291,11 @@ def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
-def git_runtime_env(env: dict[str, str] | None = None) -> dict[str, str]:
+def git_runtime_env(
+    env: dict[str, str] | None = None,
+    *,
+    include_ssh_proxy_command: bool = True,
+) -> dict[str, str]:
     merged = os.environ.copy()
     if env:
         merged.update(env)
@@ -299,7 +304,9 @@ def git_runtime_env(env: dict[str, str] | None = None) -> dict[str, str]:
     if proxy_url:
         merged.setdefault("ALL_PROXY", proxy_url)
         merged.setdefault("all_proxy", proxy_url)
-        if "GIT_SSH_COMMAND" not in merged and SOCKS_PROXY_COMMAND.is_file():
+        if not include_ssh_proxy_command:
+            merged.pop("GIT_SSH_COMMAND", None)
+        elif "GIT_SSH_COMMAND" not in merged and SOCKS_PROXY_COMMAND.is_file():
             python_bin = shutil.which("python3") or shutil.which("python") or sys.executable
             proxy_command = shlex.join([python_bin, str(SOCKS_PROXY_COMMAND), "--proxy", proxy_url, "%h", "%p"])
             merged["GIT_SSH_COMMAND"] = shlex.join(["ssh", "-o", f"ProxyCommand={proxy_command}"])
@@ -312,9 +319,16 @@ def run_git(
     *,
     cwd: Path,
     env: dict[str, str] | None = None,
+    include_ssh_proxy_command: bool = True,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(["git", *args], cwd=cwd, env=git_runtime_env(env), capture_output=True, check=check)
+    return run_command(
+        ["git", *args],
+        cwd=cwd,
+        env=git_runtime_env(env, include_ssh_proxy_command=include_ssh_proxy_command),
+        capture_output=True,
+        check=check,
+    )
 
 
 def command_output(completed: subprocess.CompletedProcess[str]) -> str:
@@ -478,6 +492,7 @@ def remote_execution_plans(root: Path, remote: str, *, push: bool) -> list[Remot
                 label="GitHub HTTPS fallback",
                 prefix_args=tuple(prefix),
                 notes=tuple(notes),
+                include_ssh_proxy_command=False,
             )
         )
     return plans
@@ -828,7 +843,12 @@ def run_git_remote_with_retry(
         if plan.notes:
             attempt_details.extend(f"{plan.label}: {note}" for note in plan.notes)
         for attempt in range(1, REMOTE_RETRY_ATTEMPTS + 1):
-            completed = run_git([*plan.prefix_args, *args], cwd=cwd, check=False)
+            completed = run_git(
+                [*plan.prefix_args, *args],
+                cwd=cwd,
+                include_ssh_proxy_command=plan.include_ssh_proxy_command,
+                check=False,
+            )
             if completed.returncode == 0:
                 return completed, attempt_details
 
