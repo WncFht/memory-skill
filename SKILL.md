@@ -15,6 +15,7 @@ Always use the skill-owned entrypoints:
 
 - `~/.codex/skills/memory-skill/scripts/init-memory.sh`
 - `~/.codex/skills/memory-skill/scripts/sync-memory.sh`
+- `~/.codex/skills/memory-skill/scripts/resolve-machine.sh`
 
 Do not improvise your own sync sequence inside the memory repo.
 
@@ -52,6 +53,8 @@ At session start, before the first user-facing response:
 3. If sync fails for any other reason, stop and surface the reason.
 4. Read the resolved repo's `core.md`.
 5. Resolve the current machine through `machines/index.md`.
+   Prefer `~/.codex/skills/memory-skill/scripts/resolve-machine.sh` instead of
+   shelling out to `hostname`; some runtimes do not provide that command.
 6. Read the matching machine summary.
 7. If the current working directory maps to a known repo, read that repo's
    `summary.md`.
@@ -91,6 +94,15 @@ Never bulk-read the whole memory tree just because it exists.
 ## Machine Resolution
 
 Resolve the machine first through `machines/index.md`.
+
+Preferred resolver:
+
+- `~/.codex/skills/memory-skill/scripts/resolve-machine.sh`
+
+That entrypoint prints the normalized hostname key used for routing. Use
+`--json` when you also need the raw hostname and the detection source. Do not
+assume `hostname` exists on PATH; if you need a shell fallback, prefer
+`uname -n`.
 
 After resolving the machine id:
 

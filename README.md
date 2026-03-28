@@ -159,6 +159,17 @@ Index files route the runtime. Packs hold the actual curated memory.
 ~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read
 ```
 
+### Resolve the current machine hostname
+
+```bash
+~/.codex/skills/memory-skill/scripts/resolve-machine.sh
+```
+
+Use `--json` if you also want the raw hostname and which detection path was
+used. Prefer this entrypoint over shelling out to `hostname`; some runtimes do
+not provide that command, and the runtime already normalizes `.local` and case
+for machine routing.
+
 ### Sync after writing
 
 ```bash
@@ -179,7 +190,8 @@ handles that reality explicitly.
 
 ### What the runtime does
 
-- Runs all git commands through a proxy-aware environment
+- Tries the configured GitHub transport first, before applying fallback overrides
+- Can retry GitHub SSH remotes through one or more SOCKS proxies without overriding every git command globally
 - Supports GitHub token-based HTTPS fallback when SSH is unavailable
 - Auto-detects common local SOCKS proxies when you do not configure one
 - Produces friendlier sync errors with actionable fixes
@@ -217,6 +229,20 @@ currently used by many desktop setups:
 
 ## Troubleshooting
 
+### Resolving the current machine fails because `hostname` is missing
+
+Do not depend on the shell `hostname` command for memory routing. Use:
+
+```bash
+~/.codex/skills/memory-skill/scripts/resolve-machine.sh
+```
+
+If you still need a shell-only fallback, prefer:
+
+```bash
+uname -n
+```
+
 ### `pre-read` says the repo has uncommitted changes
 
 `pre-read` only trusts a clean worktree. Commit or discard the changes, or run
@@ -226,6 +252,7 @@ currently used by many desktop setups:
 
 Use one of these approaches:
 
+- let the runtime try direct SSH first, then local SOCKS-assisted SSH automatically
 - export `MEMORY_SYNC_SOCKS_PROXY`
 - make sure a local SOCKS proxy is available on a common port
 - export `MEMORY_SYNC_GITHUB_TOKEN` for HTTPS fallback to private repos

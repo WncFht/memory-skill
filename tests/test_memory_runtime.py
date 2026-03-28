@@ -25,10 +25,13 @@ sys.modules[RUNTIME_SPEC.name] = memory_runtime
 RUNTIME_SPEC.loader.exec_module(memory_runtime)
 SYNC_WRAPPER = ROOT / "scripts" / "sync-memory.sh"
 INIT_WRAPPER = ROOT / "scripts" / "init-memory.sh"
+MACHINE_WRAPPER = ROOT / "scripts" / "resolve-machine.sh"
 SYNC_CMD = ROOT / "scripts" / "sync-memory.cmd"
 INIT_CMD = ROOT / "scripts" / "init-memory.cmd"
+MACHINE_CMD = ROOT / "scripts" / "resolve-machine.cmd"
 SYNC_PS1 = ROOT / "scripts" / "sync-memory.ps1"
 INIT_PS1 = ROOT / "scripts" / "init-memory.ps1"
+MACHINE_PS1 = ROOT / "scripts" / "resolve-machine.ps1"
 
 
 def run(args: list[str], *, env: dict[str, str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -218,17 +221,54 @@ class MemoryRuntimeTests(unittest.TestCase):
     def test_supported_entrypoints_exist_and_posix_wrappers_work(self) -> None:
         self.assertTrue(SYNC_WRAPPER.is_file())
         self.assertTrue(INIT_WRAPPER.is_file())
+        self.assertTrue(MACHINE_WRAPPER.is_file())
         self.assertTrue(SYNC_CMD.is_file())
         self.assertTrue(INIT_CMD.is_file())
+        self.assertTrue(MACHINE_CMD.is_file())
         self.assertTrue(SYNC_PS1.is_file())
         self.assertTrue(INIT_PS1.is_file())
+        self.assertTrue(MACHINE_PS1.is_file())
 
         init_help = run([str(INIT_WRAPPER), "--help"], env=self.env())
         sync_help = run([str(SYNC_WRAPPER), "--help"], env=self.env())
+        machine_help = run([str(MACHINE_WRAPPER), "--help"], env=self.env())
         self.assertEqual(init_help.returncode, 0, init_help.stderr)
         self.assertEqual(sync_help.returncode, 0, sync_help.stderr)
+        self.assertEqual(machine_help.returncode, 0, machine_help.stderr)
         self.assertIn("usage:", init_help.stdout)
         self.assertIn("usage:", sync_help.stdout)
+        self.assertIn("usage:", machine_help.stdout)
+
+    def test_normalize_machine_hostname_strips_local_suffix_and_normalizes_case(self) -> None:
+        self.assertEqual(
+            memory_runtime.normalize_machine_hostname("Fanghaotians-MacBook-Air.local"),
+            "fanghaotians-macbook-air",
+        )
+
+    def test_detect_host_identity_falls_back_to_environment(self) -> None:
+        with (
+            mock.patch.object(memory_runtime.socket, "gethostname", side_effect=OSError("boom")),
+            mock.patch.object(memory_runtime.platform, "node", return_value=""),
+            mock.patch.object(memory_runtime.os, "uname", side_effect=OSError("boom"), create=True),
+        ):
+            identity = memory_runtime.detect_host_identity({"HOSTNAME": "ArchBox.local"})
+
+        self.assertEqual(identity.raw, "ArchBox.local")
+        self.assertEqual(identity.normalized, "archbox")
+        self.assertEqual(identity.source, "HOSTNAME")
+
+    def test_resolve_machine_wrapper_outputs_normalized_hostname_by_default(self) -> None:
+        result = run([str(MACHINE_WRAPPER)], env=self.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^[a-z0-9-]+$")
+
+    def test_resolve_machine_wrapper_outputs_json(self) -> None:
+        result = run([str(MACHINE_WRAPPER), "--json"], env=self.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("normalized_hostname", payload)
+        self.assertIn("raw_hostname", payload)
+        self.assertIn("source", payload)
 
     def test_github_https_url_parses_common_remote_forms(self) -> None:
         self.assertEqual(
@@ -259,11 +299,76 @@ class MemoryRuntimeTests(unittest.TestCase):
         proxy = memory_runtime.socks_proxy_url({"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"})
         self.assertEqual(proxy, "socks5://127.0.0.1:7897")
 
-    def test_git_runtime_env_builds_git_ssh_command_for_socks_proxy(self) -> None:
+    def test_git_runtime_env_preserves_explicit_proxy_without_forcing_git_ssh_command(self) -> None:
         env = memory_runtime.git_runtime_env({"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"})
         self.assertEqual(env["ALL_PROXY"], "socks5://127.0.0.1:7897")
-        self.assertIn("ssh_via_socks.py", env["GIT_SSH_COMMAND"])
-        self.assertIn("socks5://127.0.0.1:7897", env["GIT_SSH_COMMAND"])
+        self.assertEqual(env["all_proxy"], "socks5://127.0.0.1:7897")
+        self.assertNotIn("GIT_SSH_COMMAND", env)
+
+    def test_remote_execution_plans_try_direct_then_proxy_ssh_then_https(self) -> None:
+        memory_root = self.temp_dir / "memory"
+        self.assertEqual(self.init_repo(memory_root).returncode, 0)
+        git(["remote", "add", "origin", "git@github.com:WncFht/agent-memory.git"], cwd=memory_root)
+
+        plans = memory_runtime.remote_execution_plans(
+            memory_root,
+            "origin",
+            push=False,
+            env={"MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897"},
+        )
+
+        self.assertEqual(
+            [plan.label for plan in plans],
+            [
+                "configured remote `origin`",
+                "GitHub SSH via SOCKS proxy socks5://127.0.0.1:7897",
+                "GitHub HTTPS fallback",
+            ],
+        )
+        self.assertIn(("ALL_PROXY", "socks5://127.0.0.1:7897"), plans[1].env_overrides)
+        self.assertIn(("GIT_SSH_COMMAND", memory_runtime.git_ssh_command_for_proxy("socks5://127.0.0.1:7897")), plans[1].env_overrides)
+
+    def test_remote_execution_plans_include_auto_detected_https_proxy_fallbacks(self) -> None:
+        memory_root = self.temp_dir / "memory"
+        self.assertEqual(self.init_repo(memory_root).returncode, 0)
+        git(["remote", "add", "origin", "git@github.com:WncFht/agent-memory.git"], cwd=memory_root)
+
+        with mock.patch.object(
+            memory_runtime,
+            "auto_detected_socks_proxy_urls",
+            return_value=["socks5://127.0.0.1:7897", "socks5h://127.0.0.1:7891"],
+        ):
+            plans = memory_runtime.remote_execution_plans(memory_root, "origin", push=False, env={})
+
+        self.assertEqual(
+            [plan.label for plan in plans],
+            [
+                "configured remote `origin`",
+                "GitHub SSH via SOCKS proxy socks5://127.0.0.1:7897",
+                "GitHub SSH via SOCKS proxy socks5h://127.0.0.1:7891",
+                "GitHub HTTPS fallback",
+                "GitHub HTTPS via SOCKS proxy socks5://127.0.0.1:7897",
+                "GitHub HTTPS via SOCKS proxy socks5h://127.0.0.1:7891",
+            ],
+        )
+
+    def test_remote_execution_plans_still_add_proxy_retries_when_git_ssh_command_is_present(self) -> None:
+        memory_root = self.temp_dir / "memory"
+        self.assertEqual(self.init_repo(memory_root).returncode, 0)
+        git(["remote", "add", "origin", "git@github.com:WncFht/agent-memory.git"], cwd=memory_root)
+
+        plans = memory_runtime.remote_execution_plans(
+            memory_root,
+            "origin",
+            push=False,
+            env={
+                "GIT_SSH_COMMAND": "/bin/false",
+                "MEMORY_SYNC_SOCKS_PROXY": "socks5://127.0.0.1:7897",
+            },
+        )
+
+        self.assertEqual(plans[1].label, "GitHub SSH via SOCKS proxy socks5://127.0.0.1:7897")
+        self.assertIn(("GIT_SSH_COMMAND", memory_runtime.git_ssh_command_for_proxy("socks5://127.0.0.1:7897")), plans[1].env_overrides)
 
     def test_git_runtime_env_omits_git_ssh_command_when_disabled(self) -> None:
         env = memory_runtime.git_runtime_env(
@@ -489,6 +594,65 @@ class MemoryRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(any(args[-1] == "include_ssh_proxy_command=False" for args in calls if "remote.origin.url=https://github.com/WncFht/agent-memory.git" in args))
         self.assertTrue(any("configured remote `origin` attempt 1/3" in detail for detail in details))
+
+    def test_run_git_remote_with_retry_applies_plan_env_overrides(self) -> None:
+        calls: list[tuple[list[str], dict[str, str] | None]] = []
+        ssh_failure = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            128,
+            "",
+            "Connection closed by 20.27.177.118 port 443",
+        )
+        proxy_success = subprocess.CompletedProcess(
+            ["git", "fetch", "--quiet", "origin"],
+            0,
+            "",
+            "",
+        )
+
+        def fake_run_git(
+            args: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str] | None = None,
+            include_ssh_proxy_command: bool = True,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append((args, env))
+            if env is None:
+                return ssh_failure
+            if env.get("GIT_SSH_COMMAND") == "ssh-proxy":
+                return proxy_success
+            raise AssertionError(f"Unexpected git call: args={args}, env={env}")
+
+        with (
+            mock.patch.object(
+                memory_runtime,
+                "remote_execution_plans",
+                return_value=[
+                    memory_runtime.RemoteExecutionPlan(label="configured remote `origin`"),
+                    memory_runtime.RemoteExecutionPlan(
+                        label="GitHub SSH via SOCKS proxy socks5://127.0.0.1:7897",
+                        env_overrides=(
+                            ("ALL_PROXY", "socks5://127.0.0.1:7897"),
+                            ("all_proxy", "socks5://127.0.0.1:7897"),
+                            ("GIT_SSH_COMMAND", "ssh-proxy"),
+                        ),
+                    ),
+                ],
+            ),
+            mock.patch.object(memory_runtime, "run_git", side_effect=fake_run_git),
+            mock.patch.object(memory_runtime, "REMOTE_RETRY_ATTEMPTS", 1),
+        ):
+            completed, _details = memory_runtime.run_git_remote_with_retry(
+                ["fetch", "--quiet", "origin"],
+                cwd=self.temp_dir,
+                remote="origin",
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(calls[0][1], None)
+        self.assertEqual(calls[1][1]["GIT_SSH_COMMAND"], "ssh-proxy")
 
     def test_fetch_remote_surfaces_github_token_fix_after_https_auth_failure(self) -> None:
         memory_root = self.temp_dir / "memory"

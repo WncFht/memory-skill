@@ -165,6 +165,16 @@ Codex 同时识别到多个 `memory-skill` 副本。
 ~/.codex/skills/memory-skill/scripts/sync-memory.sh pre-read
 ```
 
+### 解析当前机器名
+
+```bash
+~/.codex/skills/memory-skill/scripts/resolve-machine.sh
+```
+
+如果还想一起看原始 hostname 和探测来源，可以加 `--json`。做 machine
+路由时，优先用这个入口，不要直接依赖 shell 里的 `hostname` 命令；有些
+runtime 里它并不存在，而且 runtime 还会顺手把 `.local` 和大小写归一化。
+
 ### 写完之后发布
 
 ```bash
@@ -185,7 +195,8 @@ Codex 同时识别到多个 `memory-skill` 副本。
 
 ### runtime 现在会做什么
 
-- 所有 git 调用都走 proxy-aware 环境
+- 先尝试 remote 当前配置的 GitHub 传输方式，再决定是否切换 fallback
+- 对 GitHub SSH remote，会按需逐个尝试可用的 SOCKS 代理，而不是全局改写所有 git 调用
 - GitHub SSH 不通时，支持带 token 的 HTTPS fallback
 - 未显式配置代理时，会尝试常见本地 SOCKS 端口
 - 失败信息会尽量给出可执行的修复提示
@@ -222,6 +233,20 @@ Codex 同时识别到多个 `memory-skill` 副本。
 
 ## 常见问题
 
+### `hostname` 命令不存在，导致当前机器解析失败
+
+不要把 shell 的 `hostname` 当成 machine routing 的前提。优先用：
+
+```bash
+~/.codex/skills/memory-skill/scripts/resolve-machine.sh
+```
+
+如果你真的只能走纯 shell fallback，再考虑：
+
+```bash
+uname -n
+```
+
 ### `pre-read` 提示 worktree 有未提交改动
 
 这是故意的。`pre-read` 只信任干净的快照。
@@ -233,6 +258,7 @@ Codex 同时识别到多个 `memory-skill` 副本。
 
 优先按这个顺序排查：
 
+- 先让 runtime 自己跑完直连 SSH -> 代理 SSH -> HTTPS fallback 这条链路
 - 显式设置 `MEMORY_SYNC_SOCKS_PROXY`
 - 确认可用的本地 SOCKS 代理确实在监听
 - 私有 repo 再补 `MEMORY_SYNC_GITHUB_TOKEN`

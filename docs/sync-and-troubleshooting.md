@@ -63,10 +63,11 @@ The runtime supports three common cases.
 
 This is the case that usually hurts the most in practice.
 
-The runtime now helps in two ways:
+The runtime now helps in three ways:
 
-1. it runs git through a proxy-aware environment
-2. it can fall back to GitHub HTTPS auth when SSH is unavailable
+1. it tries the configured GitHub transport first
+2. it can retry GitHub SSH remotes through one or more SOCKS proxies
+3. it can fall back to GitHub HTTPS auth when SSH is unavailable
 
 ## 5. Proxy Behavior
 
@@ -82,7 +83,12 @@ already configured. If you have already exported `HTTP_PROXY`,
 `HTTPS_PROXY`, `ALL_PROXY`, or their lowercase variants, the runtime treats
 that as an intentional proxy setup and will not inject an extra SOCKS-based
 `GIT_SSH_COMMAND` on top of it.
+The runtime does not blindly inject auto-detected proxies into every git call.
+For GitHub remotes it prefers:
 
+1. configured transport as-is
+2. SOCKS-assisted GitHub SSH retries, one proxy candidate at a time
+3. GitHub HTTPS fallback, plus proxy-assisted HTTPS retries when needed
 Current built-in local auto-detection targets:
 
 - `socks5://127.0.0.1:7897`
@@ -106,7 +112,8 @@ machines that already export HTTP or HTTPS proxy variables.
 ## 6. GitHub Auth Fallback
 
 When the remote points at GitHub and SSH transport fails, the runtime can retry
-using HTTPS plus a token.
+using HTTPS plus a token. If local SOCKS proxies were auto-detected, the runtime
+can also retry that HTTPS fallback through those proxies one by one.
 
 Supported token variables, in priority order:
 
@@ -124,6 +131,18 @@ The token should have access to the private memory repo. If your environment
 already uses a git credential helper, that is also fine.
 
 ## 7. Common Failure Modes
+
+### Resolving the current machine via `hostname` fails
+
+Meaning:
+
+- the shell environment does not provide a `hostname` command
+
+Fix:
+
+- use `~/.codex/skills/memory-skill/scripts/resolve-machine.sh`
+- add `--json` if you also need the raw hostname and detection source
+- if you truly need a shell-only fallback, prefer `uname -n`
 
 ### `Memory repo ... has uncommitted changes`
 
@@ -151,10 +170,11 @@ Likely causes:
 
 Fix order:
 
-1. set `MEMORY_SYNC_SOCKS_PROXY`
-2. confirm the proxy actually works
-3. export `MEMORY_SYNC_GITHUB_TOKEN` for private GitHub repos
-4. retry `pre-read`
+1. let the runtime exhaust direct SSH, proxy-assisted SSH, and HTTPS fallback once
+2. set `MEMORY_SYNC_SOCKS_PROXY` if you know the exact working proxy
+3. confirm the proxy actually works
+4. export `MEMORY_SYNC_GITHUB_TOKEN` for private GitHub repos
+5. retry `pre-read`
 
 ### `Timed out waiting for the sync lock`
 

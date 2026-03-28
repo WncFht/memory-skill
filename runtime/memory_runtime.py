@@ -7,6 +7,8 @@ import base64
 import contextlib
 import json
 import os
+import platform
+import re
 import shlex
 import shutil
 import socket
@@ -107,8 +109,16 @@ class MemoryRuntimeError(Exception):
 class RemoteExecutionPlan:
     label: str
     prefix_args: tuple[str, ...] = ()
+    env_overrides: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
     include_ssh_proxy_command: bool = True
+
+
+@dataclass(frozen=True)
+class HostIdentity:
+    raw: str
+    normalized: str
+    source: str
 
 
 class FriendlyArgumentParser(argparse.ArgumentParser):
@@ -127,6 +137,60 @@ def utc_now() -> datetime:
 
 def iso_now() -> str:
     return utc_now().isoformat()
+
+
+def normalize_machine_hostname(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.lower().endswith(".local"):
+        cleaned = cleaned[:-6]
+    cleaned = re.sub(r"[^0-9A-Za-z]+", "-", cleaned.lower()).strip("-")
+    return cleaned
+
+
+def detect_host_identity(env: Mapping[str, str] | None = None) -> HostIdentity:
+    source_env = env or os.environ
+    candidates: list[tuple[str, str]] = []
+
+    def add_candidate(source: str, value: str | None) -> None:
+        if value is None:
+            return
+        cleaned = value.strip()
+        if cleaned:
+            candidates.append((source, cleaned))
+
+    with contextlib.suppress(OSError):
+        add_candidate("socket.gethostname()", socket.gethostname())
+    with contextlib.suppress(OSError):
+        add_candidate("platform.node()", platform.node())
+    if hasattr(os, "uname"):
+        with contextlib.suppress(OSError, AttributeError):
+            add_candidate("os.uname().nodename", os.uname().nodename)
+    add_candidate("HOSTNAME", source_env.get("HOSTNAME"))
+    add_candidate("COMPUTERNAME", source_env.get("COMPUTERNAME"))
+
+    seen: set[str] = set()
+    for source, raw in candidates:
+        normalized = normalize_machine_hostname(raw)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        return HostIdentity(raw=raw, normalized=normalized, source=source)
+
+    raise MemoryRuntimeError(
+        what="Could not determine the current machine hostname.",
+        why="Machine memory routing depends on a stable local host identifier.",
+        fix="Ensure Python can resolve the local hostname, or export `HOSTNAME` or `COMPUTERNAME`, then retry.",
+    )
+
+
+def same_machine_hostname(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    left_normalized = normalize_machine_hostname(left)
+    right_normalized = normalize_machine_hostname(right)
+    if left_normalized and right_normalized:
+        return left_normalized == right_normalized
+    return left.strip() == right.strip()
 
 
 def print_failure(error: MemoryRuntimeError) -> None:
@@ -297,20 +361,49 @@ def has_configured_proxy_env(env: Mapping[str, str] | None = None) -> bool:
     return any(source.get(name, "").strip() for name in GENERIC_PROXY_ENV_VARS)
 
 
-def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
+def explicit_socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
     source = env or os.environ
     for name in SOCKS_PROXY_ENV_VARS:
         value = source.get(name)
         if value and value.strip().lower().startswith(("socks5://", "socks5h://")):
             return value.strip()
+    return None
+
+
+def auto_detected_socks_proxy_urls(env: Mapping[str, str] | None = None) -> list[str]:
+    source = env or os.environ
     if source.get("MEMORY_SYNC_DISABLE_LOCAL_PROXY_AUTODETECT") == "1":
-        return None
+        return []
     if has_configured_proxy_env(source):
-        return None
+        return []
+    proxies: list[str] = []
     for candidate in DEFAULT_LOCAL_SOCKS_PROXIES:
         if supports_socks5_no_auth(candidate):
-            return candidate
-    return None
+            proxies.append(candidate)
+    return proxies
+
+
+def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
+    explicit = explicit_socks_proxy_url(env)
+    if explicit:
+        return explicit
+    proxies = auto_detected_socks_proxy_urls(env)
+    return proxies[0] if proxies else None
+
+
+def available_socks_proxy_urls(env: Mapping[str, str] | None = None) -> list[str]:
+    explicit = explicit_socks_proxy_url(env)
+    if explicit:
+        return [explicit]
+    return auto_detected_socks_proxy_urls(env)
+
+
+def git_ssh_command_for_proxy(proxy_url: str) -> str | None:
+    if not SOCKS_PROXY_COMMAND.is_file():
+        return None
+    python_bin = shutil.which("python3") or shutil.which("python") or sys.executable
+    proxy_command = shlex.join([python_bin, str(SOCKS_PROXY_COMMAND), "--proxy", proxy_url, "%h", "%p"])
+    return shlex.join(["ssh", "-o", f"ProxyCommand={proxy_command}"])
 
 
 def git_runtime_env(
@@ -322,16 +415,12 @@ def git_runtime_env(
     if env:
         merged.update(env)
 
-    proxy_url = socks_proxy_url(merged)
+    proxy_url = explicit_socks_proxy_url(merged)
     if proxy_url:
         merged.setdefault("ALL_PROXY", proxy_url)
         merged.setdefault("all_proxy", proxy_url)
-        if not include_ssh_proxy_command:
-            merged.pop("GIT_SSH_COMMAND", None)
-        elif "GIT_SSH_COMMAND" not in merged and SOCKS_PROXY_COMMAND.is_file():
-            python_bin = shutil.which("python3") or shutil.which("python") or sys.executable
-            proxy_command = shlex.join([python_bin, str(SOCKS_PROXY_COMMAND), "--proxy", proxy_url, "%h", "%p"])
-            merged["GIT_SSH_COMMAND"] = shlex.join(["ssh", "-o", f"ProxyCommand={proxy_command}"])
+    if not include_ssh_proxy_command:
+        merged.pop("GIT_SSH_COMMAND", None)
 
     return merged
 
@@ -483,15 +572,56 @@ def is_auth_remote_failure(output: str) -> bool:
     return any(marker in lowered for marker in AUTH_REMOTE_ERROR_MARKERS)
 
 
-def remote_execution_plans(root: Path, remote: str, *, push: bool) -> list[RemoteExecutionPlan]:
+def is_github_ssh_remote(remote_url: str) -> bool:
+    parsed = split_git_remote_url(remote_url)
+    if not parsed:
+        return False
+    host, _repo_path = parsed
+    if host not in GITHUB_REMOTE_HOSTS:
+        return False
+    lowered = remote_url.strip().lower()
+    return not lowered.startswith(("http://", "https://"))
+
+
+def proxy_env_overrides(proxy_url: str, *, include_ssh_command: bool) -> tuple[tuple[str, str], ...]:
+    env: list[tuple[str, str]] = [("ALL_PROXY", proxy_url), ("all_proxy", proxy_url)]
+    if include_ssh_command:
+        ssh_command = git_ssh_command_for_proxy(proxy_url)
+        if ssh_command is None:
+            return ()
+        env.append(("GIT_SSH_COMMAND", ssh_command))
+    return tuple(env)
+
+
+def remote_execution_plans(
+    root: Path,
+    remote: str,
+    *,
+    push: bool,
+    env: Mapping[str, str] | None = None,
+) -> list[RemoteExecutionPlan]:
     source_url = remote_push_url(root, remote) if push else remote_url(root, remote)
     if not source_url:
         return [RemoteExecutionPlan(label=f"configured remote `{remote}`")]
 
+    source_env = env or os.environ
     https_url = github_https_url(source_url)
-    token, token_name = github_token()
+    token, token_name = github_token(source_env)
 
     plans = [RemoteExecutionPlan(label=f"configured remote `{remote}`")]
+    if is_github_ssh_remote(source_url):
+        for proxy_url in available_socks_proxy_urls(source_env):
+            env_overrides = proxy_env_overrides(proxy_url, include_ssh_command=True)
+            if not env_overrides:
+                continue
+            plans.append(
+                RemoteExecutionPlan(
+                    label=f"GitHub SSH via SOCKS proxy {proxy_url}",
+                    env_overrides=env_overrides,
+                    notes=(f"SOCKS proxy: {proxy_url}",),
+                )
+            )
+
     if not https_url:
         return plans
 
@@ -508,7 +638,7 @@ def remote_execution_plans(root: Path, remote: str, *, push: bool) -> list[Remot
     else:
         notes.append("Authentication source: none")
 
-    if prefix:
+    if prefix or source_url != https_url:
         plans.append(
             RemoteExecutionPlan(
                 label="GitHub HTTPS fallback",
@@ -517,6 +647,17 @@ def remote_execution_plans(root: Path, remote: str, *, push: bool) -> list[Remot
                 include_ssh_proxy_command=False,
             )
         )
+
+        if explicit_socks_proxy_url(source_env) is None:
+            for proxy_url in available_socks_proxy_urls(source_env):
+                plans.append(
+                    RemoteExecutionPlan(
+                        label=f"GitHub HTTPS via SOCKS proxy {proxy_url}",
+                        prefix_args=tuple(prefix),
+                        env_overrides=proxy_env_overrides(proxy_url, include_ssh_command=False),
+                        notes=tuple([*notes, f"SOCKS proxy: {proxy_url}"]),
+                    )
+                )
     return plans
 
 
@@ -536,17 +677,21 @@ def remote_failure_fix(root: Path, remote: str, *, push: bool, output: str) -> s
 
     if is_auth_remote_failure(output):
         return (
-            "SSH access to GitHub is unavailable on this machine, and the HTTPS fallback reached GitHub but "
+            "The runtime exhausted GitHub SSH attempts and the HTTPS fallback reached GitHub but "
             "did not have credentials for the private repo. Export one of "
             f"{', '.join(f'`{name}`' for name in GITHUB_TOKEN_ENV_VARS)} or configure a git credential helper, "
             "then retry."
         )
 
-    return (
-        "The configured GitHub remote could not be reached over its current transport. Check SSH reachability "
-        "to GitHub, or export one of "
-        f"{', '.join(f'`{name}`' for name in GITHUB_TOKEN_ENV_VARS)} so the runtime can retry over HTTPS."
-    )
+    if is_github_ssh_remote(source_url or ""):
+        return (
+            "The runtime could not reach GitHub over direct SSH, any available local SOCKS-assisted SSH path, "
+            "or HTTPS fallback. Check GitHub SSH reachability, export `MEMORY_SYNC_SOCKS_PROXY` if you know a "
+            "working proxy, or export one of "
+            f"{', '.join(f'`{name}`' for name in GITHUB_TOKEN_ENV_VARS)} so HTTPS fallback can authenticate."
+        )
+
+    return "The configured GitHub remote could not be reached. Check network access, proxy settings, and credentials, then retry."
 
 
 def has_unresolved_conflicts(root: Path) -> bool:
@@ -727,11 +872,14 @@ class RepoLock:
         self.heartbeat_file = self.lock_dir / "heartbeat"
         self._stop_event = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
-        self.hostname = socket.gethostname()
+        self.host_identity = detect_host_identity()
+        self.hostname = self.host_identity.normalized
 
     def owner_payload(self) -> dict[str, Any]:
         return {
             "host": self.hostname,
+            "raw_host": self.host_identity.raw,
+            "host_source": self.host_identity.source,
             "pid": os.getpid(),
             "operation": self.operation,
             "memory_root": str(self.root),
@@ -773,7 +921,7 @@ class RepoLock:
         owner = self.read_owner()
         owner_host = owner.get("host")
         owner_pid = int(owner.get("pid", 0) or 0)
-        if owner_host == self.hostname:
+        if same_machine_hostname(owner_host, self.hostname) or same_machine_hostname(owner.get("raw_host"), self.hostname):
             alive = pid_is_alive(owner_pid)
             details.append(f"Owner pid alive: {alive}")
             if alive:
@@ -801,7 +949,7 @@ class RepoLock:
         owner = self.read_owner()
         lines = []
         if owner:
-            for key in ("host", "pid", "operation", "memory_root", "started_at"):
+            for key in ("host", "raw_host", "host_source", "pid", "operation", "memory_root", "started_at"):
                 value = owner.get(key)
                 if value is not None:
                     lines.append(f"{key}={value}")
@@ -865,9 +1013,11 @@ def run_git_remote_with_retry(
         if plan.notes:
             attempt_details.extend(f"{plan.label}: {note}" for note in plan.notes)
         for attempt in range(1, REMOTE_RETRY_ATTEMPTS + 1):
+            plan_env = dict(plan.env_overrides) if plan.env_overrides else None
             completed = run_git(
                 [*plan.prefix_args, *args],
                 cwd=cwd,
+                env=plan_env,
                 include_ssh_proxy_command=plan.include_ssh_proxy_command,
                 check=False,
             )
@@ -1088,6 +1238,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Lock wait timeout in seconds. Default: {WAIT_TIMEOUT_SECONDS}.",
     )
 
+    machine_parser = subparsers.add_parser(
+        "machine",
+        help="Resolve the current machine hostname for memory routing.",
+    )
+    machine_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the resolved hostname as JSON instead of the normalized hostname only.",
+    )
+
     return parser
 
 
@@ -1116,6 +1276,24 @@ def handle_sync(args: argparse.Namespace) -> None:
     sync_post_write(root, args.message, args.lock_timeout_seconds)
 
 
+def handle_machine(args: argparse.Namespace) -> None:
+    identity = detect_host_identity()
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "raw_hostname": identity.raw,
+                    "normalized_hostname": identity.normalized,
+                    "source": identity.source,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    print(identity.normalized)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1123,6 +1301,8 @@ def main(argv: list[str] | None = None) -> int:
         handle_init(args)
     elif args.command == "sync":
         handle_sync(args)
+    elif args.command == "machine":
+        handle_machine(args)
     else:
         parser.error(f"unknown command: {args.command}")
     return 0
