@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -8,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -269,6 +271,153 @@ class MemoryRuntimeTests(unittest.TestCase):
             include_ssh_proxy_command=False,
         )
         self.assertEqual(env["ALL_PROXY"], "socks5://127.0.0.1:7897")
+
+    def test_git_runtime_env_does_not_force_socks_for_http_proxy_port(self) -> None:
+        ready = threading.Event()
+        stop = threading.Event()
+        server_errors: list[Exception] = []
+
+        def fake_http_proxy() -> None:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind(("127.0.0.1", 0))
+                    server.listen()
+                    port = server.getsockname()[1]
+                    self.http_proxy_port = port
+                    ready.set()
+                    server.settimeout(0.2)
+                    while not stop.is_set():
+                        try:
+                            conn, _addr = server.accept()
+                        except socket.timeout:
+                            continue
+                        with conn:
+                            with contextlib.suppress(OSError):
+                                conn.recv(1024)
+                                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            except Exception as exc:  # pragma: no cover - test infrastructure
+                server_errors.append(exc)
+                ready.set()
+
+        self.http_proxy_port = 0
+        thread = threading.Thread(target=fake_http_proxy, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=3), "proxy test server did not start")
+        self.addCleanup(stop.set)
+        self.addCleanup(thread.join, 1)
+        if server_errors:
+            raise server_errors[0]
+
+        http_proxy = f"http://127.0.0.1:{self.http_proxy_port}"
+        candidate = f"socks5://127.0.0.1:{self.http_proxy_port}"
+        with mock.patch.object(memory_runtime, "DEFAULT_LOCAL_SOCKS_PROXIES", (candidate,)):
+            env = memory_runtime.git_runtime_env(
+                {
+                    "ALL_PROXY": http_proxy,
+                    "all_proxy": http_proxy,
+                    "HTTP_PROXY": http_proxy,
+                    "HTTPS_PROXY": http_proxy,
+                }
+            )
+
+        self.assertEqual(env["ALL_PROXY"], http_proxy)
+        self.assertEqual(env["all_proxy"], http_proxy)
+        self.assertNotIn("GIT_SSH_COMMAND", env)
+
+    def test_socks_proxy_url_accepts_auto_detected_proxy_after_handshake(self) -> None:
+        ready = threading.Event()
+        stop = threading.Event()
+        server_errors: list[Exception] = []
+
+        def fake_socks_proxy() -> None:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind(("127.0.0.1", 0))
+                    server.listen()
+                    port = server.getsockname()[1]
+                    self.socks_proxy_port = port
+                    ready.set()
+                    server.settimeout(0.2)
+                    while not stop.is_set():
+                        try:
+                            conn, _addr = server.accept()
+                        except socket.timeout:
+                            continue
+                        with conn:
+                            greeting = conn.recv(3)
+                            if greeting == b"\x05\x01\x00":
+                                conn.sendall(b"\x05\x00")
+            except Exception as exc:  # pragma: no cover - test infrastructure
+                server_errors.append(exc)
+                ready.set()
+
+        self.socks_proxy_port = 0
+        thread = threading.Thread(target=fake_socks_proxy, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=3), "proxy test server did not start")
+        self.addCleanup(stop.set)
+        self.addCleanup(thread.join, 1)
+        if server_errors:
+            raise server_errors[0]
+
+        candidate = f"socks5://127.0.0.1:{self.socks_proxy_port}"
+        with mock.patch.object(memory_runtime, "DEFAULT_LOCAL_SOCKS_PROXIES", (candidate,)):
+            proxy = memory_runtime.socks_proxy_url({})
+
+        self.assertEqual(proxy, candidate)
+
+    def test_git_runtime_env_skips_auto_detect_when_http_proxy_env_is_already_set(self) -> None:
+        ready = threading.Event()
+        stop = threading.Event()
+        server_errors: list[Exception] = []
+
+        def fake_socks_proxy() -> None:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind(("127.0.0.1", 0))
+                    server.listen()
+                    port = server.getsockname()[1]
+                    self.preconfigured_proxy_port = port
+                    ready.set()
+                    server.settimeout(0.2)
+                    while not stop.is_set():
+                        try:
+                            conn, _addr = server.accept()
+                        except socket.timeout:
+                            continue
+                        with conn:
+                            greeting = conn.recv(3)
+                            if greeting == b"\x05\x01\x00":
+                                conn.sendall(b"\x05\x00")
+            except Exception as exc:  # pragma: no cover - test infrastructure
+                server_errors.append(exc)
+                ready.set()
+
+        self.preconfigured_proxy_port = 0
+        thread = threading.Thread(target=fake_socks_proxy, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=3), "proxy test server did not start")
+        self.addCleanup(stop.set)
+        self.addCleanup(thread.join, 1)
+        if server_errors:
+            raise server_errors[0]
+
+        http_proxy = "http://127.0.0.1:7897"
+        candidate = f"socks5://127.0.0.1:{self.preconfigured_proxy_port}"
+        with mock.patch.object(memory_runtime, "DEFAULT_LOCAL_SOCKS_PROXIES", (candidate,)):
+            env = memory_runtime.git_runtime_env(
+                {
+                    "ALL_PROXY": http_proxy,
+                    "all_proxy": http_proxy,
+                    "HTTP_PROXY": http_proxy,
+                    "HTTPS_PROXY": http_proxy,
+                }
+            )
+
+        self.assertEqual(env["ALL_PROXY"], http_proxy)
         self.assertNotIn("GIT_SSH_COMMAND", env)
 
     def test_fetch_remote_tries_github_https_fallback_after_ssh_failure(self) -> None:

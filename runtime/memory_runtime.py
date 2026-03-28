@@ -26,6 +26,8 @@ STATE_FILE = Path.home() / ".codex" / "state" / "memory-skill" / "state.json"
 TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / "templates" / "memory-tree"
 SOCKS_PROXY_COMMAND = Path(__file__).resolve().with_name("ssh_via_socks.py")
 DEFAULT_COMMIT_MESSAGE = "chore(memory): update memory packs"
+SOCKS5_NO_AUTH_GREETING = b"\x05\x01\x00"
+SOCKS5_NO_AUTH_ACCEPT = b"\x05\x00"
 
 
 def env_float(name: str, default: float) -> float:
@@ -52,6 +54,14 @@ REMOTE_RETRY_BASE_DELAY_SECONDS = 1.0
 GITHUB_TOKEN_ENV_VARS = ("MEMORY_SYNC_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 GITHUB_REMOTE_HOSTS = {"github.com", "ssh.github.com"}
 SOCKS_PROXY_ENV_VARS = ("MEMORY_SYNC_SOCKS_PROXY", "ALL_PROXY", "all_proxy")
+GENERIC_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+)
 DEFAULT_LOCAL_SOCKS_PROXIES = (
     "socks5://127.0.0.1:7897",
     "socks5h://127.0.0.1:7891",
@@ -259,14 +269,6 @@ def run_command(
     return completed
 
 
-def local_tcp_listener(host: str, port: int, timeout: float = 0.2) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 def proxy_host_port(proxy_url: str) -> tuple[str, int] | None:
     parsed = urlsplit(proxy_url)
     host = parsed.hostname
@@ -274,6 +276,25 @@ def proxy_host_port(proxy_url: str) -> tuple[str, int] | None:
     if not host or not port:
         return None
     return host, port
+
+
+def supports_socks5_no_auth(proxy_url: str, timeout: float = 0.2) -> bool:
+    host_port = proxy_host_port(proxy_url)
+    if host_port is None:
+        return False
+
+    try:
+        with socket.create_connection(host_port, timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(SOCKS5_NO_AUTH_GREETING)
+            return sock.recv(2) == SOCKS5_NO_AUTH_ACCEPT
+    except OSError:
+        return False
+
+
+def has_configured_proxy_env(env: Mapping[str, str] | None = None) -> bool:
+    source = env or os.environ
+    return any(source.get(name, "").strip() for name in GENERIC_PROXY_ENV_VARS)
 
 
 def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
@@ -284,9 +305,10 @@ def socks_proxy_url(env: Mapping[str, str] | None = None) -> str | None:
             return value.strip()
     if source.get("MEMORY_SYNC_DISABLE_LOCAL_PROXY_AUTODETECT") == "1":
         return None
+    if has_configured_proxy_env(source):
+        return None
     for candidate in DEFAULT_LOCAL_SOCKS_PROXIES:
-        host_port = proxy_host_port(candidate)
-        if host_port and local_tcp_listener(*host_port):
+        if supports_socks5_no_auth(candidate):
             return candidate
     return None
 

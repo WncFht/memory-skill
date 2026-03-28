@@ -77,6 +77,12 @@ Proxy resolution order:
 3. `all_proxy`
 4. local auto-detection unless disabled
 
+Local SOCKS auto-detection only runs when no generic proxy environment is
+already configured. If you have already exported `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, or their lowercase variants, the runtime treats
+that as an intentional proxy setup and will not inject an extra SOCKS-based
+`GIT_SSH_COMMAND` on top of it.
+
 Current built-in local auto-detection targets:
 
 - `socks5://127.0.0.1:7897`
@@ -93,6 +99,9 @@ If you want deterministic behavior, set the proxy explicitly:
 ```bash
 export MEMORY_SYNC_SOCKS_PROXY=socks5://127.0.0.1:7897
 ```
+
+Use `MEMORY_SYNC_SOCKS_PROXY` when you explicitly want SSH-over-SOCKS even on
+machines that already export HTTP or HTTPS proxy variables.
 
 ## 6. GitHub Auth Fallback
 
